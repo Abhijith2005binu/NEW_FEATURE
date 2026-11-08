@@ -12,8 +12,11 @@ import YouTubeVideo, { extractYouTubeId } from '../components/YouTubeVideo'
 import useIsMobile from '../hooks/useIsMobile'
 import { API_URL } from '../config.js'
 import { installUnlockOnInteraction, playStudentQuestion, unlockAudio } from '../lib/sounds'
-import { Bell, Check, CircleCheck, Clapperboard, ClipboardList, Hourglass, Lightbulb, Mic, TriangleAlert, Trophy, X } from 'lucide-react'
+import { Bell, Check, CircleCheck, Clapperboard, ClipboardList, Headphones, Hourglass, Lightbulb, Mic, TriangleAlert, Trophy, WifiOff, X } from 'lucide-react'
 import { Ico } from '../components/icons'
+import AudioOnlyViewport from '../components/AudioOnlyViewport'
+import { setMediaStreamsAudioOnly } from '../lib/mediaStreamControl'
+import { savePendingResponse, syncPendingResponses } from '../lib/responseVault'
 
 // Spread the ~N students' navigation to the results page over this window (ms). When a big room
 // ends, all students receive room:ended at once; without a spread they'd all hit the results
@@ -68,6 +71,63 @@ function StudentRoomPage() {
     if (r !== 'blocked') setSoundBlocked(false)
   }
 
+  // Low-bandwidth "Audio Only" Mode with client-side localStorage persistence
+  const [audioOnlyMode, setAudioOnlyMode] = useState(() => {
+    try {
+      return localStorage.getItem('spandan.audioOnlyMode') === 'true'
+    } catch (e) {
+      return false
+    }
+  })
+  const audioOnlyModeRef = useRef(audioOnlyMode)
+  useEffect(() => {
+    audioOnlyModeRef.current = audioOnlyMode
+    setMediaStreamsAudioOnly(audioOnlyMode)
+  }, [audioOnlyMode])
+
+  const [toastMessage, setToastMessage] = useState(null)
+  const toastTimerRef = useRef(null)
+  const showToast = (msg) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current)
+    setToastMessage(msg)
+    toastTimerRef.current = setTimeout(() => {
+      setToastMessage(null)
+      toastTimerRef.current = null
+    }, 3500)
+  }
+
+  const handleToggleAudioOnly = (targetVal) => {
+    const next = typeof targetVal === 'boolean' ? targetVal : !audioOnlyMode
+    setAudioOnlyMode(next)
+    try {
+      localStorage.setItem('spandan.audioOnlyMode', String(next))
+    } catch (e) {}
+    setMediaStreamsAudioOnly(next)
+    showToast(next ? 'Audio Only Mode Active — Stream Paused' : 'Standard Video Mode Restored')
+  }
+
+  // Live Speech-to-Text Transcription stream state
+  const [liveTranscript, setLiveTranscript] = useState('')
+  const lastVideoProgressAtRef = useRef(0)
+
+  // Auto-detect poor network conditions (e.g. 2g or saveData) and switch to Audio Only Mode
+  useEffect(() => {
+    if (typeof navigator !== 'undefined' && navigator.connection) {
+      const conn = navigator.connection
+      const evaluateNetwork = () => {
+        if (conn.saveData || conn.effectiveType === '2g' || conn.effectiveType === 'slow-2g') {
+          if (!audioOnlyModeRef.current) {
+            handleToggleAudioOnly(true)
+            showToast('Low bandwidth connection detected — Switched to Audio Only Mode')
+          }
+        }
+      }
+      evaluateNetwork()
+      conn.addEventListener?.('change', evaluateNetwork)
+      return () => conn.removeEventListener?.('change', evaluateNetwork)
+    }
+  }, [])
+
   useEffect(() => {
     if (!isVideoMode) return
     const p = studentPlayerRef.current
@@ -107,13 +167,17 @@ function StudentRoomPage() {
     if (!socket) return
 
     const handleQuestionStarted = (data) => {
-      setCurrentQuestion(data)
+      const q = (data?.question && typeof data.question === 'object')
+        ? { ...data.question, questionId: data.questionId || data.question._id || data.question.id, timer: data.timer || data.question.timeToAnswer }
+        : data
+      setCurrentQuestion(q)
       setSelectedOptions([])
       setSubmitted(false)
-      setTimeLeft(data.timer || 30)
-      
-      if (data.question && data.question.timeToAnswer) {
-        setTimeLeft(data.question.timeToAnswer)
+      setTimeLeft(q.timer || q.timeToAnswer || 30)
+
+      // Haptic alert notification for incoming poll
+      if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+        try { navigator.vibrate([100, 50, 100]) } catch (e) {}
       }
       
       // Clear any existing timer
@@ -161,6 +225,11 @@ function StudentRoomPage() {
         clearInterval(timerIntervalRef.current)
         timerIntervalRef.current = null
       }
+
+      // Haptic alert notification for incoming poll
+      if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+        try { navigator.vibrate([100, 50, 100]) } catch (e) {}
+      }
       
       setCurrentQuestion(question)
       setSelectedOptions([])
@@ -187,13 +256,28 @@ function StudentRoomPage() {
     // Self-heal after a socket reconnect: the store re-joins the room automatically, but a
     // question pushed WHILE we were briefly disconnected would have been missed. Re-pull the
     // room's questions so any missed one surfaces without the student manually refreshing.
+    // Also sync any queued offline answers from the Response Vault.
     const handleReconnect = () => {
       if (room?._id && user?._id) {
         fetchPastResponses(room._id, user._id)
       }
+      if (token) {
+        syncPendingResponses(token, (syncedCount) => {
+          showToast(`Synced ${syncedCount} response(s) from offline vault`)
+          if (room?._id && user?._id) {
+            fetchPastResponses(room._id, user._id)
+          }
+        })
+      }
     }
 
     const handleVideoProgress = (data) => {
+      // Socket throttling: when in Audio Only mode, throttle progress processing
+      if (audioOnlyModeRef.current) {
+        const now = performance.now()
+        if (now - lastVideoProgressAtRef.current < 8000) return
+        lastVideoProgressAtRef.current = now
+      }
       const t = Number(data?.time)
       if (!Number.isFinite(t)) return
       teacherVideoTimeRef.current = { time: t, playing: !!data?.playing, at: performance.now() }
@@ -203,8 +287,23 @@ function StudentRoomPage() {
     const handleVideoResume = () => setTeacherVideoPaused(false)
     // Teacher's GENERATED batch arrived (once per segment / Paste & Generate; never for Create Q).
     const handleQuestionsReady = async () => {
+      if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+        try { navigator.vibrate([100, 50, 100]) } catch (e) {}
+      }
       const r = await playStudentQuestion()
       if (r === 'blocked') setSoundBlocked(true)
+    }
+
+    // Live speech-to-text chunk listener (PR #139) - remains active in Audio Only mode
+    const handleTranscriptionChunk = (data) => {
+      if (data?.text) {
+        setLiveTranscript(prev => (prev ? prev + ' ' : '') + data.text.trim())
+      }
+    }
+
+    // Non-essential WebSocket listeners (throttled/dropped in Audio Only mode to save bandwidth)
+    const handleNonEssentialEvent = () => {
+      if (audioOnlyModeRef.current) return // Throttled / discarded in Audio Only mode
     }
 
     socket.on('question:started', handleQuestionStarted)
@@ -214,6 +313,13 @@ function StudentRoomPage() {
     socket.on('video:pause', handleVideoPause)
     socket.on('video:resume', handleVideoResume)
     socket.on('questions:ready', handleQuestionsReady)
+    socket.on('transcription:chunk', handleTranscriptionChunk)
+    socket.on('cursor:move', handleNonEssentialEvent)
+    socket.on('cursor:update', handleNonEssentialEvent)
+    socket.on('canvas:draw', handleNonEssentialEvent)
+    socket.on('whiteboard:update', handleNonEssentialEvent)
+    socket.on('chat:image', handleNonEssentialEvent)
+    socket.on('chat:typing', handleNonEssentialEvent)
     socket.on('connect', handleReconnect)
     socket.on('room:ended', () => {
       // Show the interstitial immediately, but stagger the actual navigation across a jitter window
@@ -233,6 +339,13 @@ function StudentRoomPage() {
       socket.off('video:pause', handleVideoPause)
       socket.off('video:resume', handleVideoResume)
       socket.off('questions:ready', handleQuestionsReady)
+      socket.off('transcription:chunk', handleTranscriptionChunk)
+      socket.off('cursor:move', handleNonEssentialEvent)
+      socket.off('cursor:update', handleNonEssentialEvent)
+      socket.off('canvas:draw', handleNonEssentialEvent)
+      socket.off('whiteboard:update', handleNonEssentialEvent)
+      socket.off('chat:image', handleNonEssentialEvent)
+      socket.off('chat:typing', handleNonEssentialEvent)
       socket.off('connect', handleReconnect)
       socket.off('room:ended')
       if (resultsNavTimerRef.current) clearTimeout(resultsNavTimerRef.current)
@@ -244,6 +357,19 @@ function StudentRoomPage() {
     try {
       const roomData = await joinRoomByCode(roomCode)
       setRoom(roomData)
+
+      // Load initial transcripts for live transcription viewport
+      fetch(`${API_URL}/transcripts/room/${roomData._id}`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      })
+        .then(r => r.ok ? r.json() : null)
+        .then(d => {
+          if (d?.transcripts?.length) {
+            const combined = d.transcripts.map(t => t.text).filter(Boolean).join(' ')
+            setLiveTranscript(combined)
+          }
+        })
+        .catch(e => console.warn('Failed to load initial transcripts:', e))
       if (user?._id && socket) {
         // Join via socket - room:joined confirms the student was added to RoomMember
         return new Promise((resolve, reject) => {
@@ -319,6 +445,11 @@ function StudentRoomPage() {
     setSubmitted(true)
     setHasAnsweredPoll(true) // Prevent accidental leave after answering
 
+    // Haptic feedback on submit
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') {
+      try { navigator.vibrate(50) } catch (e) {}
+    }
+
     // Client-side jitter: spread submissions across 0–2s so a synchronized classroom of 500+ does
     // not all hit POST /responses in the same instant. A simultaneous burst saturates the 2-core
     // event loop and starves the next question's broadcast (the missed-poll root cause); smearing
@@ -331,7 +462,15 @@ function StudentRoomPage() {
 
     if (jitterMs > 0) await new Promise(resolve => setTimeout(resolve, jitterMs))
 
-    // Save to MongoDB
+    const responsePayload = {
+      roomId,
+      questionId,
+      studentId,
+      selectedOptions,
+      responseTime
+    }
+
+    // Save to MongoDB (with offline vault fallback)
     try {
       const saveResponse = await fetch(`${API_URL}/responses`, {
         method: 'POST',
@@ -339,14 +478,11 @@ function StudentRoomPage() {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({
-          roomId,
-          questionId,
-          studentId,
-          selectedOptions,
-          responseTime
-        })
+        body: JSON.stringify(responsePayload)
       })
+      if (!saveResponse.ok) {
+        throw new Error(`Server returned status ${saveResponse.status}`)
+      }
       const saveData = await saveResponse.json()
       console.log('[StudentRoom] Response saved:', saveData)
 
@@ -354,7 +490,9 @@ function StudentRoomPage() {
       // authenticated POST — the client no longer emits points:update / response:submit. The
       // leaderboard (incl. this student's own row) refreshes once per segment, not per submit.
     } catch (err) {
-      console.error('Failed to save response:', err)
+      console.warn('Network issue saving response, safely queued in offline vault:', err)
+      savePendingResponse(responsePayload)
+      showToast('Offline / Network lag: Response safely saved in vault and will sync automatically')
     }
 
     if (roomId && studentId) {
@@ -478,6 +616,51 @@ function StudentRoomPage() {
 
         {/* Content */}
         <div style={{ flex: 1, padding: isMobile ? '16px' : '32px', width: '100%', boxSizing: 'border-box', overflowX: 'hidden' }}>
+          {/* Floating Toast Notification */}
+          {toastMessage && (
+            <div
+              role="status"
+              aria-live="polite"
+              data-testid="audio-only-toast"
+              style={{
+                position: 'fixed',
+                top: '20px',
+                left: '50%',
+                transform: 'translateX(-50%)',
+                zIndex: 9999,
+                background: 'var(--bg-card, #1e293b)',
+                color: 'var(--text-primary, #f8fafc)',
+                border: '1.5px solid var(--accent, #3b82f6)',
+                boxShadow: '0 10px 30px rgba(0, 0, 0, 0.25)',
+                padding: '10px 20px',
+                borderRadius: '999px',
+                fontSize: '13px',
+                fontWeight: '600',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '10px',
+                maxWidth: '90vw',
+                animation: 'fadeIn 0.2s ease'
+              }}
+            >
+              <WifiOff size={15} style={{ color: 'var(--accent, #3b82f6)' }} />
+              <span>{toastMessage}</span>
+              <button
+                onClick={() => setToastMessage(null)}
+                aria-label="Dismiss notification"
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  color: 'var(--text-secondary, #94a3b8)',
+                  cursor: 'pointer',
+                  padding: '2px',
+                  display: 'inline-flex'
+                }}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          )}
           {showHint && (
             <div role="note" style={{
               background: 'var(--bg-card)', border: '1px solid color-mix(in srgb, var(--accent) 45%, transparent)', borderLeft: '4px solid var(--accent)',
@@ -517,6 +700,42 @@ function StudentRoomPage() {
               </span>
             </div>
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+            {/* Audio Only Mode Toggle */}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={audioOnlyMode}
+              onClick={() => handleToggleAudioOnly()}
+              title={audioOnlyMode ? 'Disable Audio Only Mode (resume video)' : 'Enable Audio Only Mode (save network bandwidth)'}
+              data-testid="audio-only-toggle"
+              style={{
+                padding: '7px 12px',
+                background: audioOnlyMode ? 'var(--tint-info-bg)' : 'var(--bg-secondary)',
+                color: audioOnlyMode ? 'var(--accent)' : 'var(--text-secondary)',
+                border: `1.5px solid ${audioOnlyMode ? 'var(--accent)' : 'var(--border-color)'}`,
+                borderRadius: '8px',
+                fontSize: '13px',
+                fontWeight: '600',
+                cursor: 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                transition: 'all 0.2s ease'
+              }}
+            >
+              <WifiOff size={15} aria-hidden="true" />
+              <span>{isMobile ? 'Audio Only' : 'Audio Only Mode'}</span>
+              <span style={{
+                fontSize: '10px',
+                fontWeight: '700',
+                padding: '1px 5px',
+                borderRadius: '4px',
+                background: audioOnlyMode ? 'var(--accent)' : 'var(--border-color)',
+                color: audioOnlyMode ? 'white' : 'var(--text-secondary)'
+              }}>
+                {audioOnlyMode ? 'ON' : 'OFF'}
+              </span>
+            </button>
             {/* Sound on/off for the question-time chime (per device) */}
             <SoundToggle />
             {soundBlocked && (
@@ -558,10 +777,41 @@ function StudentRoomPage() {
             </div>
           </div>
 
+          {/* Audio-Only Viewport Placeholder */}
+          {audioOnlyMode && (
+            <AudioOnlyViewport
+              isLiveStream={isLiveStream}
+              liveTranscript={liveTranscript}
+              currentQuestion={currentQuestion}
+              timeLeft={timeLeft}
+              selectedOptions={selectedOptions}
+              onSelectOption={(idx, isMSQ) => {
+                if (submitted) return
+                if (isMSQ) {
+                  setSelectedOptions(prev => prev.includes(idx) ? prev.filter(i => i !== idx) : [...prev, idx])
+                } else {
+                  setSelectedOptions([idx])
+                }
+              }}
+              onSubmitAnswer={handleSubmitAnswer}
+              submitted={submitted}
+              isMobile={isMobile}
+              onSwitchToVideo={() => handleToggleAudioOnly(false)}
+            />
+          )}
+
           {/* Video (video mode) — persistent so it doesn't remount when questions come/go.
-              Hidden (not unmounted) while a question is live so the poll takes over like normal mode. */}
+              Hidden in zero-render wrapper when in audioOnlyMode so audio continues uninterrupted,
+              or hidden while a question is live. */}
           {isVideoMode && videoId && (
-            <div style={{
+            <div style={audioOnlyMode ? {
+              position: 'absolute',
+              width: '1px',
+              height: '1px',
+              opacity: 0,
+              pointerEvents: 'none',
+              overflow: 'hidden'
+            } : {
               display: currentQuestion ? 'none' : 'block',
               background: 'var(--bg-card)',
               borderRadius: 'var(--radius-lg)',
@@ -623,7 +873,7 @@ function StudentRoomPage() {
 
               {/* Question */}
               <h2 style={{ fontSize: isMobile ? '20px' : '24px', fontWeight: '700', textAlign: 'center', marginBottom: isMobile ? '24px' : '32px', wordBreak: 'break-word' }}>
-                {currentQuestion.question}
+                {typeof currentQuestion.question === 'string' ? currentQuestion.question : (currentQuestion.question?.question || '')}
               </h2>
 
               {/* Options */}
@@ -752,8 +1002,8 @@ function StudentRoomPage() {
               Leaderboard keeps its socket subscription and updates ONLY on the once-per-segment
               leaderboard:updated push, instead of re-fetching on every poll's remount. */}
           <div style={{ display: currentQuestion ? 'none' : 'flex', flexDirection: 'column', gap: '24px' }}>
-              {/* Active question area placeholder — hidden in video mode (the player fills this space) */}
-              {!isVideoMode && (
+              {/* Active question area placeholder — hidden in video mode or when audio-only viewport is active */}
+              {!isVideoMode && !audioOnlyMode && (
               <div data-tour="question-area" style={{
                 background: 'var(--bg-card)',
                 borderRadius: 'var(--radius-lg)',

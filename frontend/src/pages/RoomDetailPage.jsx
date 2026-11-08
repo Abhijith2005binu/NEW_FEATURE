@@ -77,6 +77,10 @@ function RoomDetailPage() {
   const [segmentTranscript, setSegmentTranscript] = useState('')
   const [segmentTimeLeft, setSegmentTimeLeft] = useState(0)
   const segmentTimerRef = useRef(null)
+  const currentSegmentRef = useRef(currentSegment)
+  useEffect(() => { currentSegmentRef.current = currentSegment }, [currentSegment])
+  const roomRef = useRef(room)
+  useEffect(() => { roomRef.current = room }, [room])
 
   // Question timer for teacher visibility
   const [activeQuestion, setActiveQuestion] = useState(null)
@@ -581,6 +585,13 @@ function RoomDetailPage() {
         setTranscript(finalTranscriptRef.current)
         segmentTranscriptRef.current += ' ' + text
         setSegmentTranscript(segmentTranscriptRef.current)
+        if (socket && roomRef.current?.code) {
+          socket.emit('transcription:chunk', {
+            roomCode: roomRef.current.code,
+            text,
+            segmentIndex: currentSegmentRef.current
+          })
+        }
       }
 
       pendingSequenceRef.current++

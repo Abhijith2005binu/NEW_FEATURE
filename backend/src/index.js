@@ -728,6 +728,17 @@ io.on('connection', (socket) => {
     socket.to(data.roomCode).emit('questions:ready')
   })
 
+  // Live speech-to-text transcription chunk broadcast from teacher to students
+  socket.on('transcription:chunk', async (data) => {
+    if (!(await verifyRoomOwner(socket, data?.roomCode))) return
+    if (!data?.text) return
+    socket.to(data.roomCode).emit('transcription:chunk', {
+      text: data.text,
+      segmentIndex: data.segmentIndex,
+      timestamp: Date.now()
+    })
+  })
+
   socket.on('disconnect', () => {
     if (socket.data?._expiryTimer) { clearTimeout(socket.data._expiryTimer); socket.data._expiryTimer = null }
     const userId = connectedUsers.get(socket.id)
