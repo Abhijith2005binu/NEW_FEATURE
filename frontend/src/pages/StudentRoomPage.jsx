@@ -24,6 +24,12 @@ import { savePendingResponse, syncPendingResponses } from '../lib/responseVault'
 // delay in [0, this) before navigating. Scoring is unaffected — the session is already over.
 const RESULTS_NAV_JITTER_MS = 4000
 
+// Runtime network probe: the OS-reported connection class (Network Information API) is absent on
+// Safari/Firefox and can misreport a congested link as fast, so flakiness is also measured directly
+// from socket reconnects. This many reconnects inside the window flips the student into Audio Only.
+const RECONNECT_WINDOW_MS = 60000
+const RECONNECT_TRIGGER_COUNT = 3
+
 function StudentRoomPage() {
   const { roomCode } = useParams()
   const navigate = useNavigate()
@@ -105,6 +111,9 @@ function StudentRoomPage() {
     setMediaStreamsAudioOnly(next)
     showToast(next ? 'Audio Only Mode Active — Stream Paused' : 'Standard Video Mode Restored')
   }
+
+  // Timestamps of recent socket disconnects, pruned to RECONNECT_WINDOW_MS on each new one.
+  const disconnectTimesRef = useRef([])
 
   // Live Speech-to-Text Transcription stream state
   const [liveTranscript, setLiveTranscript] = useState('')
@@ -271,6 +280,20 @@ function StudentRoomPage() {
       }
     }
 
+    // Runtime probe: a burst of socket reconnects means the link is flaky even when the OS reports
+    // a healthy connection class (or on browsers with no Network Information API at all).
+    const handleDisconnectProbe = () => {
+      const now = Date.now()
+      const recent = disconnectTimesRef.current.filter(t => now - t < RECONNECT_WINDOW_MS)
+      recent.push(now)
+      disconnectTimesRef.current = recent
+      if (recent.length >= RECONNECT_TRIGGER_COUNT && !audioOnlyModeRef.current) {
+        disconnectTimesRef.current = []
+        handleToggleAudioOnly(true)
+        showToast('Unstable connection detected — Switched to Audio Only Mode')
+      }
+    }
+
     const handleVideoProgress = (data) => {
       // Socket throttling: when in Audio Only mode, throttle progress processing
       if (audioOnlyModeRef.current) {
@@ -321,6 +344,7 @@ function StudentRoomPage() {
     socket.on('chat:image', handleNonEssentialEvent)
     socket.on('chat:typing', handleNonEssentialEvent)
     socket.on('connect', handleReconnect)
+    socket.on('disconnect', handleDisconnectProbe)
     socket.on('room:ended', () => {
       // Show the interstitial immediately, but stagger the actual navigation across a jitter window
       // so all students don't hit the results endpoints in the same instant.
@@ -347,6 +371,7 @@ function StudentRoomPage() {
       socket.off('chat:image', handleNonEssentialEvent)
       socket.off('chat:typing', handleNonEssentialEvent)
       socket.off('connect', handleReconnect)
+      socket.off('disconnect', handleDisconnectProbe)
       socket.off('room:ended')
       if (resultsNavTimerRef.current) clearTimeout(resultsNavTimerRef.current)
     }

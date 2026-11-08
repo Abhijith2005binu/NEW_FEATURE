@@ -104,6 +104,28 @@ describe('Low-Bandwidth Audio Only Mode for Student Classroom View', () => {
     expect(screen.getByTestId('audio-only-viewport')).toBeInTheDocument()
   })
 
+  it('auto-switches to Audio Only after a burst of socket reconnects (runtime probe)', async () => {
+    mount()
+    await screen.findByRole('heading', { name: 'Physics 101' })
+    await act(async () => { fire('room:joined', { roomCode: 'ROOM99' }) })
+
+    const toggle = screen.getByTestId('audio-only-toggle')
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+
+    // Two reconnects stay under the trigger threshold
+    await act(async () => {
+      fire('disconnect', 'transport close')
+      fire('disconnect', 'transport close')
+    })
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+
+    // Third reconnect inside the window trips the probe
+    await act(async () => { fire('disconnect', 'transport close') })
+    expect(toggle).toHaveAttribute('aria-checked', 'true')
+    expect(localStorage.getItem('spandan.audioOnlyMode')).toBe('true')
+    expect(screen.getByTestId('audio-only-toast')).toHaveTextContent(/Unstable connection detected/i)
+  })
+
   it('streams live speech-to-text transcriptions into the viewport', async () => {
     localStorage.setItem('spandan.audioOnlyMode', 'true')
     mount()
