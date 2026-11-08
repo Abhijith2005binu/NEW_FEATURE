@@ -32,6 +32,13 @@ export default defineConfig(({ mode }) => {
         '/socket.io': {
           target: 'http://localhost:3001',
           ws: true
+        },
+        // The client hardcodes path '/spandan/socket.io' (the production nginx path). In dev the
+        // app is served at /spandan/ too, so rewrite that prefix away before proxying to the backend.
+        '/spandan/socket.io': {
+          target: 'http://localhost:3001',
+          ws: true,
+          rewrite: (p) => p.replace(/^\/spandan/, '')
         }
       }
     }
